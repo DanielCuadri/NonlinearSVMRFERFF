@@ -12,4 +12,4 @@ Nonlinear SVM-RFE with Random Fourier Features (RFF). Extends traditional SVM-RF
     - **scale**: This function standardizes the numeric columns of a data frame.
     - **sigest**: This function computes heuristic estimates for the scale parameter (sigma) of a kernel based on the distances between observations. Supports Gaussian and Laplace kernels.
     - **utils**: This function computes the decision function values for a linear SVM in the original feature space, given support vector coefficients and bias.
-- `data/`: datasets used for the experiment + Alon's cancer dataset + Golub's Leukemia dataset.
+- `data/`: datasets used for the experiment + Alon's cancer dataset + Golub's Leukemia dataset read in the example file.
