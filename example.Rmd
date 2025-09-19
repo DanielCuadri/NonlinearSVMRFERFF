@@ -1,0 +1,503 @@
+---
+title: "SVM-RFE with RFF"
+author: "Daniel Cuadrillero Moles"
+date: "2025-04-05"
+output: pdf_document
+---
+
+```{r, echo=FALSE}
+library(svmpath)
+library(e1071)
+library(caret)
+library(MASS)
+library(kernlab)
+library(pracma)
+library(stats)
+library(ggplot2)
+library(iterators)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(tictoc)
+library(golubEsets)
+library(Bessel)
+library(HiDimDA)
+library(LiblineaR)
+library(RhpcBLASctl)
+library(proxy)
+# install.packages("LiblineaR")
+# install.packages("RhpcBLASctl")
+# install.packages("BiocManager")
+# BiocManager::install("golubEsets")
+```
+
+```{r}
+source("R/rfe.R")
+source("R/utils.R")
+source("R/irff.R")
+source("R/orf.R")
+source("R/rff.R")
+source("R/sigest.R")
+source("R/scale.R")
+```
+
+# GOLUB'S LEUKEMIA DATASET
+
+```{r}
+data(Golub_Merge)
+sample_ids <- as.numeric(sampleNames(Golub_Merge))
+
+ordered_index <- order(sample_ids)
+
+Golub_ordered <- Golub_Merge[, ordered_index]
+
+X_all <- t(exprs(Golub_ordered))
+y_all <- Golub_ordered$ALL.AML
+
+# First 38 rows are for training and the others for test
+# Predefined by the authors
+X_train <- X_all[1:38,]
+y_train <- y_all[1:38]
+
+X_test <- X_all[39:72,]
+y_test <- y_all[39:72]
+
+X_train_scaled <- my_scale(X_train)
+X_train <- X_train_scaled$scaled_data
+X_test <-my_scale(X_test, X_train_scaled$mu, X_train_scaled$sigma)
+
+y_test <- factor(ifelse(y_test == "ALL", -1, 1))
+y_train <- factor((ifelse(y_train == "ALL", -1, 1)))
+
+dim(X_train)
+dim(X_test)
+
+table(y_train)
+
+table(y_test)
+
+gene_names <- featureNames(Golub_ordered)
+gene_dict <- setNames(gene_names, seq_along(gene_names))
+```
+
+# ALON'S COLON CANCER DATASET
+
+```{r}
+# Read the data
+data(AlonDS)
+Alon <- AlonDS
+X_all <- as.matrix(AlonDS[, -1])
+y_all <- AlonDS$grouping
+
+# First 31 rows are for training and the otherS for test, as suggested  in original RFE paper
+X_train <- X_all[1:31, ]
+y_train <- y_all[1:31]
+
+X_test <- X_all[32:62, ]
+y_test <- y_all[32:62]
+
+X_train_scaled <- my_scale(X_train)
+X_train <- X_train_scaled$scaled_data
+X_test <- my_scale(X_test, X_train_scaled$mu, X_train_scaled$sigma)
+
+y_test <- factor(ifelse(y_test == "colonc", -1, 1))
+y_train <- factor((ifelse(y_train == "colonc", -1, 1)))
+
+dim(X_train)
+dim(X_test)
+
+table(y_all)
+
+table(y_train)
+
+table(y_test)
+```
+
+
+```{r}
+example <- rfe_rff_svm(X_train, y_train,
+    num_runs = 5,
+    kernel_choice = "cauchy",
+    D_frac = 2,
+    C_values = c(1, 10, 100, 1000, 10000, 1e5),
+    k = 5,
+    delF0 = 0.50,
+    delFmin = 0.01,
+    fixed_delF = 0)
+```
+
+# VALIDATION
+
+```{r}
+plot(unlist(example$cv_accuracies[[1]]), type = "l", col = 1, lwd = 2,
+     ylim = range(unlist(example$cv_accuracies)), 
+     xlab = "Iter", ylab = "Accuracy")
+
+for (i in 2:length(example$cv_accuracies)) {
+  lines(unlist(example$cv_accuracies[[i]]), col = i, lwd = 2)
+}
+
+legend("bottomright", legend = paste("Run", 1:5),
+       col = 1:5, lty = 1, lwd = 2)
+```
+
+```{r}
+all_cv <- list(example$cv_accuracies)
+colors <- rainbow(length(all_cv))
+
+max_avg <- numeric(length(all_cv))
+max_iter <- numeric(length(all_cv))
+
+all_values <- unlist(lapply(all_cv, function(cv) {
+  mat <- do.call(rbind, lapply(cv, unlist))
+  c(mat)
+}))
+ylim_range <- range(all_values)
+
+for (i in seq_along(all_cv)) {
+  mat <- do.call(rbind, lapply(all_cv[[i]], unlist))
+  avg <- colMeans(mat)
+  
+  max_value <- max(avg)
+  
+  max_index <- max(which(avg == max_value))
+  
+  max_avg[i] <- max_value
+  max_iter[i] <- max_index
+  
+  if (i == 1) {
+    plot(avg, type = "l", col = colors[i], lwd = 2,
+         ylim = ylim_range, xlab = "Iter", ylab = "Accuracy")
+  } else {
+    lines(avg, col = colors[i], lwd = 2)
+  }
+}
+
+kernel_list <- c("Cauchy RFF")
+
+legend("bottomright", legend = paste(" ", kernel_list),
+       col = colors, lty = 1, lwd = 2, cex = 0.8)
+```
+
+# TEST
+
+```{r}
+cauchydot_factory <- function(gamma = 1) {
+  new("kernel", .Data = function(x, y) {
+    d2 <- sum((x - y)^2)
+    return(1 / (1 + gamma * d2))
+  })
+}
+
+materndot_factory <- function(gamma = 1) {
+  new("kernel", .Data = function(x, y) {
+    r <- sqrt(sum((x - y)^2))
+    sqrt3g_r <- sqrt(3 * gamma) * r
+    return((1 + sqrt3g_r) * exp(-sqrt3g_r))
+  })
+}
+```
+
+```{r}
+# Auxiliar function to train nonlinear SVM with given number of features and compute results on test set
+compute_accuracy_nonlinear <- function(X_train, X_test, y_train, y_test, resultados2, i, l, kernel_func = "gaussian", val_frac = 0.2) {
+  features <- as.character(tail(resultados2[[i]], l))
+  
+  colnames(X_train) <- as.character(1:ncol(X_train))
+  data_iter <- X_train[, (colnames(X_train) %in% features), drop = FALSE]
+  
+  colnames(X_test) <- as.character(1:ncol(X_test))
+  data_test <- X_test[, (colnames(X_test) %in% features), drop = FALSE]
+  
+  sigma2 <- manual_sigest(data_iter, kernel = kernel_func)
+  sigma <- as.numeric((sigma2[1] + sigma2[3]) / 2)
+  gamma <- 1 / (2 * sigma * sigma)
+  
+  if (kernel_func == "gaussian"){
+    kernel_choice <- rbfdot(sigma = gamma)
+  }
+  if (kernel_func == "laplace"){
+    kernel_choice <- laplacedot(sigma = gamma)
+  }
+  if (kernel_func == "cauchy"){
+    kernel_choice <- cauchydot_factory(gamma = gamma)
+  }
+  if (kernel_func == "matern"){
+    kernel_choice <- materndot_factory(gamma = gamma)
+  }
+  if (kernel_func == "linear"){
+    kernel_choice <- "vanilladot"
+  }
+
+  n <- nrow(data_iter)
+  val_idx <- sample(seq_len(n), size = floor(val_frac * n))
+  train_idx <- setdiff(seq_len(n), val_idx)
+  
+  data_train <- data_iter[train_idx, , drop = FALSE]
+  y_train_internal <- y_train[train_idx]
+  data_val <- data_iter[val_idx, , drop = FALSE]
+  y_val_internal <- y_train[val_idx]
+  
+  C_values <- c(1, 10, 100, 1000, 10000, 1e5)
+  val_errors <- sapply(C_values, function(C_val) {
+    model_cv <- ksvm(
+      x = as.matrix(data_train),
+      y = y_train_internal,
+      type = "C-svc",
+      kernel = kernel_choice,
+      C = C_val,
+      scaled = FALSE
+    )
+    pred_val <- predict(model_cv, as.matrix(data_val))
+    mean(pred_val != y_val_internal)
+  })
+  
+  best_C <- C_values[which.min(val_errors)]
+  
+  modelo <- ksvm(
+    x = as.matrix(data_iter),
+    y = y_train,
+    type = "C-svc",
+    kernel = kernel_choice,
+    C = best_C,
+    scaled = FALSE
+  )
+  
+  pred <- predict(modelo, data_test)
+  accuracy <- mean(pred == y_test)
+  
+  return(accuracy)
+}
+```
+
+```{r}
+# Auxiliar function to train linear SVM with given number of features and compute results on test set
+# Only used for Indefinite RFF (Delta Gaussian kernel)
+compute_accuracy_linear <- function(X_train, X_test, y_train, y_test, res, i, l, kernel_func = "gaussian", D_frac = 2){
+  
+  features <- as.character(tail(res[[i]], l))
+  C_values <- c(1, 10, 100, 1000, 10000, 1e5)
+  num_cores <- min(length(C_values), parallel::detectCores())
+  cl <- makeCluster(num_cores)
+  registerDoParallel(cl)
+  k <- 5
+  
+  colnames(X_train) <- as.character(1:ncol(X_train))
+  data_iter <- X_train[, (colnames(X_train) %in% features), drop = FALSE]
+  
+  colnames(X_test) <- as.character(1:ncol(X_test))
+  data_test <- X_test[, (colnames(X_test) %in% features), drop = FALSE]
+  
+  if (kernel_func == "IRF"){
+    D <- 4*round((ncol(X_train)*D_frac)/4)
+  }
+  else{
+    D <- 2*round((ncol(X_train)*D_frac)/2)
+  }
+  
+  transform <- NULL
+  sneg <- 0
+  spos <- 0
+  
+  n <- nrow(data_iter)
+  val_idx <- sample(seq_len(n), size = floor(0.20 * n))
+  train_idx <- setdiff(seq_len(n), val_idx)
+  
+  train_y <- as.numeric(as.character(y_train[train_idx]))
+  val_y   <- as.numeric(as.character(y_train[-train_idx]))
+  
+  data_iter2 <- data_iter[-train_idx, , drop = FALSE]
+  data_iter <- data_iter[train_idx, , drop = FALSE]
+  
+  
+  sigma2 <- manual_sigest(data_iter, kernel = kernel_func)
+  sigma <- as.numeric((sigma2[1] + sigma2[3]) / 2)
+  gamma <- 1 / (2 * sigma^2)
+  sigma1 <- sigma
+  sigma2 <- sigma*10
+    
+  if (kernel_func == "ORF"){
+    result <- orthogonal_random_features(data_iter, D, gamma, NULL)
+    transform <- result$random_vectors
+    result2 <- orthogonal_random_features(data_iter2, D, gamma, transform)
+    result3 <- orthogonal_random_features(data_test, D, gamma, transform)
+  }
+  else if (kernel_func == "IRF"){
+    result <- indefinite_rff(data_iter, D, NULL, sigma1, sigma2, sneg=sneg, spos=spos)
+    transform <- result$random_vectors
+    sneg <- result$sneg
+    spos <- result$spos
+    result2 <- indefinite_rff(data_iter2, D, transform, sigma1, sigma2, sneg=sneg, spos=spos)
+    result3 <- indefinite_rff(data_test, D, transform, sigma1, sigma2, sneg=sneg, spos=spos)
+  }
+  else{
+    result <- random_fourier_features(data_iter, D, gamma, NULL, kernel = kernel_choice)
+    transform <- result$random_vectors
+    result2 <- random_fourier_features(data_iter2, D, gamma, transform, kernel = kernel_choice)
+    result3 <- random_fourier_features(data_test, D, gamma, transform, kernel = kernel_choice)
+  }
+    
+    
+  modelo_svm <- tryCatch(
+    {
+      svmpath(result$features, train_y)
+    },
+    error = function(e) {
+      if (grepl("system is exactly singular", e$message) ||
+        grepl("system is computationally singular", e$message) ||
+        grepl("non-conformable arrays", e$message)) {
+        print(e$message)
+        return(NULL)
+      } else {
+        print(e)
+        return(NULL)
+      }
+    }
+   )
+
+  if(is.null(modelo_svm)){
+      
+    features <- rbind(result$features, result2$features) 
+    yy_train <- as.numeric(c(train_y, val_y)) 
+    n <- nrow(features) 
+    fold_ids <- sample(rep(1:k, length.out = n)) 
+      
+    cv_acc <- foreach(C_val = C_values, .combine = c, .packages = "LiblineaR") %dopar% {
+      acc <- LiblineaR(
+        data = as.matrix(features),
+        target = yy_train,
+        type = 1,
+        cost = C_val,
+        cross = k
+      )
+      acc
+    }
+    best_C <- C_values[which.max(cv_acc)] 
+      
+    modelo <- LiblineaR(
+        data = as.matrix(features),
+        target = yy_train,
+        type = 1,
+        cost = best_C
+    )
+    
+    w <- as.vector(modelo$W[-length(modelo$W)])
+    b <- modelo$Bias
+    
+    scores <- as.matrix(result3$features) %*% as.numeric(w) + b
+    preds <- ifelse(scores >= 0, 1, -1)
+    test_accuracy <- mean(preds == y_test)
+    
+    stopCluster(cl)
+    
+    return(test_accuracy)
+  }
+  
+  else{
+    
+    accuracies <- numeric(length(modelo_svm$lambda))
+      
+    indices_lambda <- round(seq(1, length(modelo_svm$lambda), length.out = num_valores <- min(20, length(modelo_svm$lambda)) ))
+    for (j in indices_lambda) {
+      coef <- as.vector(modelo_svm$alpha[, j])
+      b <- modelo_svm$alpha0[j]
+      lambda <- modelo_svm$lambda[j]
+        
+      precision <- evaluar_modelo(result$features, train_y, coef, b, result2$features, val_y)
+      accuracies[j] <- precision
+    }
+    
+    best_accuracy <- max(accuracies)
+    best_lambda_indices <- which(accuracies == best_accuracy)
+    best_lambda <- max(modelo_svm$lambda[best_lambda_indices])
+    best_lambda_index <- which(modelo_svm$lambda == best_lambda)
+    best_b <- modelo_svm$alpha0[best_lambda_index]
+      
+    alphas <- as.vector(modelo_svm$alpha[, best_lambda_index])
+      
+    v <- alphas * train_y
+    w <- as.vector(crossprod(v, result$features))
+    
+    scores <- as.matrix(result3$features) %*% as.numeric(w) + best_b
+    preds <- ifelse(scores >= 0, 1, -1)
+    test_accuracy <- mean(preds == y_test)
+    
+    stopCluster(cl)
+    
+    return(test_accuracy)
+  }
+  
+}
+```
+
+```{r}
+tic("RFF - RFE RESULTS")
+set.seed(123)
+
+# result_linear <- resultados
+listas_resultados <- list(example$feature_rankings)
+listas_kernel <- list("cauchy")
+
+n_listas <- length(listas_resultados)
+
+# Number of features
+l_values <- seq(2, 100, by = 2)
+
+colores <- c("blue", "red", "green", "purple", "orange", "black")
+
+todas_medias <- vector("list", n_listas)
+todas_desvios <- vector("list", n_listas)
+
+for (j in seq_along(listas_resultados)) {
+  resultados_j <- listas_resultados[[j]]
+  kernel_choice <- listas_kernel[[j]]
+  
+  medias <- numeric(length(l_values))
+  desvios <- numeric(length(l_values))
+  
+  for (idx in seq_along(l_values)) {
+    l <- l_values[idx]
+    
+    accuracies_l <- numeric(length(resultados_j))
+    for (i in seq_along(resultados_j)) {
+      if (kernel_choice == "IRF"){
+        accuracies_l[i] <- compute_accuracy_linear(X_train, X_test, y_train, y_test, resultados_j, i, l, kernel_func = kernel_choice, D_frac = 2)
+      }
+      else{
+        accuracies_l[i] <- compute_accuracy_nonlinear(X_train, X_test, y_train, y_test, resultados_j, i, l, kernel_func = kernel_choice)
+      }
+    }
+    
+    medias[idx] <- mean(accuracies_l, na.rm = TRUE)
+    desvios[idx] <- sd(accuracies_l, na.rm = TRUE)
+  }
+  
+  todas_medias[[j]] <- medias
+  todas_desvios[[j]] <- desvios
+}
+toc()
+```
+
+```{r}
+plot(l_values, todas_medias[[1]], type = "b", col = colores[1], pch = 19,
+     ylim = c(0.3, 1), xlab = "# features", ylab = "Average accuracy",
+     main = "Accuracies with different SVM-RFE methods")
+
+arrows(l_values, todas_medias[[1]] - todas_desvios[[1]],
+       l_values, todas_medias[[1]] + todas_desvios[[1]],
+       angle = 90, code = 3, length = 0.05, col = colores[1])
+
+for (j in 1:n_listas) {
+  lines(l_values, todas_medias[[j]], type = "b", col = colores[j], pch = 19)
+  arrows(l_values, todas_medias[[j]] - todas_desvios[[j]],
+         l_values, todas_medias[[j]] + todas_desvios[[j]],
+         angle = 90, code = 3, length = 0.05, col = colores[j])
+}
+
+delF_list <- c("Cauchy RFF")
+
+legend("bottomright",
+       legend = paste("", delF_list),
+       col = colores, pch = 19, lty = 1)
+
+```
